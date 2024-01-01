@@ -674,12 +674,21 @@ extern "C" {
             struct llama_context * ctx,
           llama_token_data_array * candidates);
 
-    /// @details Top-K sampling described in academic paper "The Curious Case of Neural Text Degeneration" https://arxiv.org/abs/1904.09751
-    LLAMA_API void llama_sample_top_k(
+    /// @details User top sampling; user dictates the likelihood of the top token being chosen.
+    LLAMA_API void llama_sample_top_c(
             struct llama_context * ctx,
           llama_token_data_array * candidates,
-                             int   k,
+                          float    userTop,
+                          float    slope,
+                          float    top_correction,
                           size_t   min_keep);
+
+    /// @details Top-K sampling described in academic paper "The Curious Case of Neural Text Degeneration" https://arxiv.org/abs/1904.09751
+    LLAMA_API void llama_sample_top_k(
+        struct llama_context* ctx,
+        llama_token_data_array* candidates,
+        int   k,
+        size_t   min_keep);
 
     /// @details Nucleus sampling described in academic paper "The Curious Case of Neural Text Degeneration" https://arxiv.org/abs/1904.09751
     LLAMA_API void llama_sample_top_p(
