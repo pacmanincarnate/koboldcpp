@@ -23,6 +23,8 @@ class load_model_inputs(ctypes.Structure):
     _fields_ = [("threads", ctypes.c_int),
                 ("blasthreads", ctypes.c_int),
                 ("max_context_length", ctypes.c_int),
+                ("batch_size", ctypes.c_int),
+                ("f16_kv", ctypes.c_bool),
                 ("low_vram", ctypes.c_bool),
                 ("use_mmq", ctypes.c_bool),
                 ("executable_path", ctypes.c_char_p),
@@ -59,7 +61,6 @@ class generation_inputs(ctypes.Structure):
                 ("tfs", ctypes.c_float),
                 ("rep_pen", ctypes.c_float),
                 ("rep_pen_range", ctypes.c_int),
-                ("presence_penalty", ctypes.c_float),
                 ("mirostat", ctypes.c_int),
                 ("mirostat_tau", ctypes.c_float),
                 ("mirostat_eta", ctypes.c_float),
@@ -75,10 +76,6 @@ class generation_inputs(ctypes.Structure):
 class generation_outputs(ctypes.Structure):
     _fields_ = [("status", ctypes.c_int),
                 ("text", ctypes.c_char * 32768)]
-
-class token_count_outputs(ctypes.Structure):
-    _fields_ = [("count", ctypes.c_int),
-                ("ids", ctypes.POINTER(ctypes.c_int))]
 
 handle = None
 
@@ -221,18 +218,20 @@ def init_library():
     handle.get_total_gens.restype = ctypes.c_int
     handle.get_last_stop_reason.restype = ctypes.c_int
     handle.abort_generate.restype = ctypes.c_bool
-    handle.token_count.restype = token_count_outputs
+    handle.token_count.restype = ctypes.c_int
     handle.get_pending_output.restype = ctypes.c_char_p
 
 def load_model(model_filename):
     global args
     inputs = load_model_inputs()
     inputs.model_filename = model_filename.encode("UTF-8")
+    inputs.batch_size = 8
     inputs.max_context_length = maxctx #initial value to use for ctx, can be overwritten
     inputs.threads = args.threads
     inputs.low_vram = (True if (args.usecublas and "lowvram" in args.usecublas) else False)
     inputs.use_mmq = (True if (args.usecublas and "mmq" in args.usecublas) else False)
     inputs.blasthreads = args.blasthreads
+    inputs.f16_kv = True
     inputs.use_mmap = (not args.nommap)
     inputs.use_mlock = args.usemlock
     inputs.lora_filename = "".encode("UTF-8")
@@ -301,7 +300,7 @@ def load_model(model_filename):
     ret = handle.load_model(inputs)
     return ret
 
-def generate(prompt, memory="", max_length=32, max_context_length=512, temperature=0.7, top_k=100, top_a=0.0, top_p=0.92, min_p=0.0, typical_p=1.0, tfs=1.0, rep_pen=1.1, rep_pen_range=128, presence_penalty=0.0, mirostat=0, mirostat_tau=5.0, mirostat_eta=0.1, sampler_order=[6,0,1,3,4,2,5], seed=-1, stop_sequence=[], use_default_badwordsids=False, stream_sse=False, grammar='', grammar_retain_state=False, genkey='', trimstop=False, quiet=False):
+def generate(prompt, memory="", max_length=32, max_context_length=512, temperature=0.7, top_k=100, top_a=0.0, top_p=0.92, min_p=0.0, typical_p=1.0, tfs=1.0, rep_pen=1.1, rep_pen_range=128, mirostat=0, mirostat_tau=5.0, mirostat_eta=0.1, sampler_order=[6,0,1,3,4,2,5], seed=-1, stop_sequence=[], use_default_badwordsids=False, stream_sse=False, grammar='', grammar_retain_state=False, genkey='', trimstop=False, quiet=False):
     global maxctx, args, currentusergenkey, totalgens
     inputs = generation_inputs()
     outputs = ctypes.create_unicode_buffer(ctypes.sizeof(generation_outputs))
@@ -309,13 +308,13 @@ def generate(prompt, memory="", max_length=32, max_context_length=512, temperatu
     inputs.memory = memory.encode("UTF-8")
     if max_length >= max_context_length:
         max_length = max_context_length-1
+    inputs.max_context_length = max_context_length   # this will resize the context buffer if changed
     global showmaxctxwarning
     if max_context_length > maxctx:
         if showmaxctxwarning:
             print(f"\n(Warning! Request max_context_length={max_context_length} exceeds allocated context size of {maxctx}. It will be reduced to fit. Consider launching with increased --contextsize to avoid errors. This message will only show once per session.)")
             showmaxctxwarning = False
         max_context_length = maxctx
-    inputs.max_context_length = max_context_length   # this will resize the context buffer if changed
     inputs.max_length = max_length
     inputs.temperature = temperature
     inputs.top_k = top_k
@@ -326,7 +325,6 @@ def generate(prompt, memory="", max_length=32, max_context_length=512, temperatu
     inputs.tfs = tfs
     inputs.rep_pen = rep_pen
     inputs.rep_pen_range = rep_pen_range
-    inputs.presence_penalty = presence_penalty
     inputs.stream_sse = stream_sse
     inputs.quiet = quiet
     inputs.grammar = grammar.encode("UTF-8")
@@ -394,23 +392,21 @@ maxhordelen = 256
 modelbusy = threading.Lock()
 requestsinqueue = 0
 defaultport = 5001
-KcppVersion = "1.53"
+KcppVersion = "1.51.1"
 showdebug = True
 showsamplerwarning = True
 showmaxctxwarning = True
 session_kudos_earned = 0
 session_jobs = 0
 session_starttime = None
-exitcounter = -1
+exitcounter = 0
 punishcounter = 0 #causes a timeout if too many errors
 rewardcounter = 0 #reduces error counts for successful jobs
 totalgens = 0
 currentusergenkey = "" #store a special key so polled streaming works even in multiuser
 args = None #global args
 gui_layers_untouched = True
-runmode_untouched = True
 preloaded_story = None
-sslvalid = False
 
 class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
     sys_version = ""
@@ -441,11 +437,10 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                 genparams["max_length"] = genparams.get('max', 100)
 
             elif api_format==3 or api_format==4:
+                frqp = genparams.get('frequency_penalty', 0.1)
+                scaled_rep_pen = genparams.get('presence_penalty', frqp) + 1
                 genparams["max_length"] = genparams.get('max_tokens', 100)
-                presence_penalty = genparams.get('presence_penalty', genparams.get('frequency_penalty', 0.0))
-                genparams["presence_penalty"] = presence_penalty
-                if presence_penalty > 0 and (genparams.get('rep_pen', 0)==0):
-                    genparams["rep_pen"] = 1.0
+                genparams["rep_pen"] = scaled_rep_pen
                 # openai allows either a string or a list as a stop sequence
                 if isinstance(genparams.get('stop',[]), list):
                     genparams["stop_sequence"] = genparams.get('stop', [])
@@ -502,7 +497,6 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                 tfs=genparams.get('tfs', 1.0),
                 rep_pen=genparams.get('rep_pen', 1.1),
                 rep_pen_range=genparams.get('rep_pen_range', 256),
-                presence_penalty=genparams.get('presence_penalty', 0.0),
                 mirostat=genparams.get('mirostat', 0),
                 mirostat_tau=genparams.get('mirostat_tau', 5.0),
                 mirostat_eta=genparams.get('mirostat_eta', 0.1),
@@ -567,47 +561,43 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
         current_token = 0
         incomplete_token_buffer = bytearray()
         await asyncio.sleep(0.05) #anti race condition, prevent check from overtaking generate
-        try:
-            while True:
-                streamDone = handle.has_finished() #exit next loop on done
-                tokenStr = ""
-                streamcount = handle.get_stream_count()
-                while current_token < streamcount:
-                    token = handle.new_token(current_token)
+        while True:
+            streamDone = handle.has_finished() #exit next loop on done
+            tokenStr = ""
+            streamcount = handle.get_stream_count()
+            while current_token < streamcount:
+                token = handle.new_token(current_token)
 
-                    if token is None: # Token isnt ready yet, received nullpointer
-                        break
-
-                    current_token += 1
-                    newbyte = ctypes.string_at(token)
-                    incomplete_token_buffer += bytearray(newbyte)
-                    tokenSeg = incomplete_token_buffer.decode("UTF-8","ignore")
-                    if tokenSeg!="":
-                        incomplete_token_buffer.clear()
-                        tokenStr += tokenSeg
-
-                if tokenStr!="":
-                    if api_format == 4:  # if oai chat, set format to expected openai streaming response
-                        event_str = json.dumps({"id":"koboldcpp","object":"chat.completion.chunk","created":1,"model":friendlymodelname,"choices":[{"index":0,"finish_reason":"length","delta":{'role':'assistant','content':tokenStr}}]})
-                        await self.send_oai_sse_event(event_str)
-                    elif api_format == 3:  # non chat completions
-                        event_str = json.dumps({"id":"koboldcpp","object":"text_completion","created":1,"model":friendlymodelname,"choices":[{"index":0,"finish_reason":"length","text":tokenStr}]})
-                        await self.send_oai_sse_event(event_str)
-                    else:
-                        event_str = json.dumps({"token": tokenStr})
-                        await self.send_kai_sse_event(event_str)
-                    tokenStr = ""
-
-                else:
-                    await asyncio.sleep(0.02) #this should keep things responsive
-
-                if streamDone:
-                    if api_format == 4:  # if oai chat, send last [DONE] message consistent with openai format
-                        await self.send_oai_sse_event('[DONE]')
+                if token is None: # Token isnt ready yet, received nullpointer
                     break
-        except Exception as ex:
-            print("SSE streaming was interrupted due to an exception")
-            print(ex)
+
+                current_token += 1
+                newbyte = ctypes.string_at(token)
+                incomplete_token_buffer += bytearray(newbyte)
+                tokenSeg = incomplete_token_buffer.decode("UTF-8","ignore")
+                if tokenSeg!="":
+                    incomplete_token_buffer.clear()
+                    tokenStr += tokenSeg
+
+            if tokenStr!="":
+                if api_format == 4:  # if oai chat, set format to expected openai streaming response
+                    event_str = json.dumps({"id":"koboldcpp","object":"chat.completion.chunk","created":1,"model":friendlymodelname,"choices":[{"index":0,"finish_reason":"length","delta":{'role':'assistant','content':tokenStr}}]})
+                    await self.send_oai_sse_event(event_str)
+                elif api_format == 3:  # non chat completions
+                    event_str = json.dumps({"id":"koboldcpp","object":"text_completion","created":1,"model":friendlymodelname,"choices":[{"index":0,"finish_reason":"length","text":tokenStr}]})
+                    await self.send_oai_sse_event(event_str)
+                else:
+                    event_str = json.dumps({"token": tokenStr})
+                    await self.send_kai_sse_event(event_str)
+                tokenStr = ""
+
+            else:
+                await asyncio.sleep(0.02) #this should keep things responsive
+
+            if streamDone:
+                if api_format == 4:  # if oai chat, send last [DONE] message consistent with openai format
+                    await self.send_oai_sse_event('[DONE]')
+                break
 
         # flush buffers, sleep a bit to make sure all data sent, and then force close the connection
         self.wfile.flush()
@@ -629,94 +619,16 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
             await asyncio.gather(*tasks)
             generate_result = generate_task.result()
             return generate_result
-        except (BrokenPipeError, ConnectionAbortedError) as cae: # attempt to abort if connection lost
+        except ConnectionAbortedError as cae: # attempt to abort if connection lost
             print(cae)
             handle.abort_generate()
-            time.sleep(0.2) #short delay
+            time.sleep(0.1) #short delay
         except Exception as e:
             print(e)
 
-    def noscript_webui(self):
-        global modelbusy
-        import html
-        import urllib.parse as urlparse
-        parsed_url = urlparse.urlparse(self.path)
-        parsed_dict = urlparse.parse_qs(parsed_url.query)
-        reply = ""
-        status = str(parsed_dict['status'][0]) if 'status' in parsed_dict else "Ready To Generate"
-        prompt = str(parsed_dict['prompt'][0]) if 'prompt' in parsed_dict else ""
-        max_length = int(parsed_dict['max_length'][0]) if 'max_length' in parsed_dict else 100
-        temperature = float(parsed_dict['temperature'][0]) if 'temperature' in parsed_dict else 0.7
-        top_k = int(parsed_dict['top_k'][0]) if 'top_k' in parsed_dict else 100
-        top_p = float(parsed_dict['top_p'][0]) if 'top_p' in parsed_dict else 0.9
-        rep_pen = float(parsed_dict['rep_pen'][0]) if 'rep_pen' in parsed_dict else 1.1
-        use_default_badwordsids = int(parsed_dict['use_default_badwordsids'][0]) if 'use_default_badwordsids' in parsed_dict else 0
-        gencommand = (parsed_dict['generate'][0] if 'generate' in parsed_dict else "")=="Generate"
-
-        if modelbusy.locked():
-            status = "Model is currently busy, try again later."
-        elif gencommand:
-            if prompt=="" or max_length<=0:
-                status = "Need a valid prompt and length to generate."
-            else:
-                if max_length>512:
-                    max_length = 512
-                epurl = f"http://localhost:{args.port}"
-                if args.host!="":
-                    epurl = f"http://{args.host}:{args.port}"
-                gen_payload = {"prompt": prompt,"max_length": max_length,"temperature": temperature,"prompt": prompt,"top_k": top_k,"top_p": top_p,"rep_pen": rep_pen,"use_default_badwordsids":use_default_badwordsids}
-                respjson = make_url_request(f'{epurl}/api/v1/generate', gen_payload)
-                reply = html.escape(respjson["results"][0]["text"])
-                status = "Generation Completed"
-
-            if "generate" in parsed_dict:
-                del parsed_dict["generate"]
-            parsed_dict["prompt"] = prompt + reply
-            parsed_dict["status"] = status
-            updated_query_string = urlparse.urlencode(parsed_dict, doseq=True)
-            updated_path = parsed_url._replace(query=updated_query_string).geturl()
-            self.path = updated_path
-            self.send_response(302)
-            self.send_header("location", self.path)
-            self.end_headers(content_type='text/html')
-            return
-
-        finalhtml = f'''<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>KoboldCpp NoScript Mode</title></head><body>
-<h2>KoboldCpp NoScript Mode</h2>
-<div>
-<p>KoboldCpp can be used without Javascript enabled, however this is not recommended.
-<br>If you have Javascript, please use <a href="/">Kobold Lite WebUI</a> instead.</p><hr>
-<form action="/noscript">
-Enter Prompt:<br>
-<textarea name="prompt" cols="60" rows="8" wrap="soft" placeholder="Enter Prompt Here">{prompt}</textarea>
-<hr>
-<b>{status}</b><br>
-<hr>
-<label>Gen. Amount</label> <input type="text" size="4" value="{max_length}" name="max_length"><br>
-<label>Temperature</label> <input type="text" size="4" value="{temperature}" name="temperature"><br>
-<label>Top-K</label> <input type="text" size="4" value="{top_k}" name="top_k"><br>
-<label>Top-P</label> <input type="text" size="4" value="{top_p}" name="top_p"><br>
-<label>Rep. Pen</label> <input type="text" size="4" value="{rep_pen}" name="rep_pen"><br>
-<label>Ignore EOS</label> <input type="checkbox" name="use_default_badwordsids" value="1" {"checked" if use_default_badwordsids else ""}><br>
-<input type="submit" name="generate" value="Generate"> (Please be patient)
-</form>
-<form action="/noscript">
-<input type="submit" value="Reset">
-</form>
-</div>
-</body></html>'''
-        finalhtml = finalhtml.encode('utf-8')
-        self.send_response(200)
-        self.send_header('content-length', str(len(finalhtml)))
-        self.end_headers(content_type='text/html')
-        self.wfile.write(finalhtml)
 
     def do_GET(self):
-        global maxctx, maxhordelen, friendlymodelname, KcppVersion, totalgens, preloaded_story, exitcounter
+        global maxctx, maxhordelen, friendlymodelname, KcppVersion, totalgens, preloaded_story
         self.path = self.path.rstrip('/')
         response_body = None
         content_type = 'application/json'
@@ -727,10 +639,6 @@ Enter Prompt:<br>
                 response_body = (f"Embedded Kobold Lite is not found.<br>You will have to connect via the main KoboldAI client, or <a href='https://lite.koboldai.net?local=1&port={self.port}'>use this URL</a> to connect.").encode()
             else:
                 response_body = self.embedded_kailite
-
-        elif self.path in ["/noscript", "/noscript?"] or self.path.startswith(('/noscript?','noscript?')): #it's possible for the root url to have ?params without /
-            self.noscript_webui()
-            return
 
         elif self.path.endswith(('/api/v1/model', '/api/latest/model')):
             response_body = (json.dumps({'result': friendlymodelname }).encode())
@@ -762,7 +670,7 @@ Enter Prompt:<br>
             lastc = handle.get_last_token_count()
             totalgens = handle.get_total_gens()
             stopreason = handle.get_last_stop_reason()
-            response_body = (json.dumps({"last_process":lastp,"last_eval":laste,"last_token_count":lastc, "total_gens":totalgens, "stop_reason":stopreason, "queue":requestsinqueue, "idle":(0 if modelbusy.locked() else 1), "hordeexitcounter":exitcounter}).encode())
+            response_body = (json.dumps({"last_process":lastp,"last_eval":laste,"last_token_count":lastc, "total_gens":totalgens, "stop_reason":stopreason, "queue":requestsinqueue, "idle":(0 if modelbusy.locked() else 1)}).encode())
 
         elif self.path.endswith('/api/extra/generate/check'):
             pendtxtStr = ""
@@ -821,11 +729,8 @@ Enter Prompt:<br>
             try:
                 genparams = json.loads(body)
                 countprompt = genparams.get('prompt', "")
-                rawcountdata = handle.token_count(countprompt.encode("UTF-8"))
-                countlimit = rawcountdata.count if (rawcountdata.count>=0 and rawcountdata.count<50000) else 0
-                # the above protects the server in case the count limit got corrupted
-                countdata = [rawcountdata.ids[i] for i in range(countlimit)]
-                response_body = (json.dumps({"value": len(countdata),"ids": countdata}).encode())
+                count = handle.token_count(countprompt.encode("UTF-8"))
+                response_body = (json.dumps({"value": count}).encode())
 
             except Exception as e:
                 utfprint("Count Tokens - Body Error: " + str(e))
@@ -941,10 +846,8 @@ Enter Prompt:<br>
                         self.send_header('content-length', str(len(genresp)))
                         self.end_headers(content_type='application/json')
                         self.wfile.write(genresp)
-                except Exception as ex:
+                except:
                     print("Generate: The response could not be sent, maybe connection was terminated?")
-                    handle.abort_generate()
-                    time.sleep(0.2) #short delay
                 return
         finally:
             modelbusy.release()
@@ -986,19 +889,12 @@ def RunServerMultiThreaded(addr, port, embedded_kailite = None, embedded_kcpp_do
             self.start()
 
         def run(self):
-            global exitcounter, sslvalid
+            global exitcounter
             handler = ServerRequestHandler(addr, port, embedded_kailite, embedded_kcpp_docs)
             with http.server.HTTPServer((addr, port), handler, False) as self.httpd:
                 try:
                     self.httpd.socket = sock
                     self.httpd.server_bind = self.server_close = lambda self: None
-
-                    if args.ssl and sslvalid:
-                        import ssl
-                        certpath = os.path.abspath(args.ssl[0])
-                        keypath = os.path.abspath(args.ssl[1])
-                        self.httpd.socket = ssl.wrap_socket(self.httpd.socket, keyfile=keypath, certfile=certpath, server_side=True)
-
                     self.httpd.serve_forever()
                 except (KeyboardInterrupt,SystemExit):
                     exitcounter = 999
@@ -1150,8 +1046,6 @@ def show_new_gui():
     horde_apikey_var = ctk.StringVar(value="")
     horde_workername_var = ctk.StringVar(value="")
     usehorde_var = ctk.IntVar()
-    ssl_cert_var = ctk.StringVar()
-    ssl_key_var = ctk.StringVar()
 
     def tabbuttonaction(name):
         for t in tabcontent:
@@ -1210,20 +1104,16 @@ def show_new_gui():
         return entry, label
 
 
-    def makefileentry(parent, text, searchtext, var, row=0, width=200, filetypes=[], onchoosefile=None, singlerow=False):
+    def makefileentry(parent, text, searchtext, var, row=0, width=250, filetypes=[], onchoosefile=None):
         makelabel(parent, text, row)
         def getfilename(var, text):
             var.set(askopenfilename(title=text,filetypes=filetypes))
             if onchoosefile:
                 onchoosefile(var.get())
         entry = ctk.CTkEntry(parent, width, textvariable=var)
+        entry.grid(row=row+1, column=0, padx=8, stick="nw")
         button = ctk.CTkButton(parent, 50, text="Browse", command= lambda a=var,b=searchtext:getfilename(a,b))
-        if singlerow:
-            entry.grid(row=row, column=1, padx=8, stick="w")
-            button.grid(row=row, column=1, padx=144, stick="nw")
-        else:
-            entry.grid(row=row+1, column=0, padx=8, stick="nw")
-            button.grid(row=row+1, column=1, stick="nw")
+        button.grid(row=row+1, column=1, stick="nw")
         return
 
     # decided to follow yellowrose's and kalomaze's suggestions, this function will automatically try to determine GPU identifiers
@@ -1289,25 +1179,15 @@ def show_new_gui():
                     MaxMemory[0] = max(int(FetchedCUdeviceMem[idx])*1024*1024,MaxMemory[0])
 
         #autopick cublas if suitable, requires at least 3.5GB VRAM to auto pick
-        global exitcounter, runmode_untouched
-        #we do not want to autoselect hip/cublas if the user has already changed their desired backend!
-        if exitcounter < 100 and MaxMemory[0]>3500000000 and (("Use CuBLAS" in runopts and CUDevicesNames[0]!="") or "Use hipBLAS (ROCm)" in runopts) and (any(CUDevicesNames) or any(CLDevicesNames)) and runmode_untouched:
+        global exitcounter
+        if exitcounter < 100 and MaxMemory[0]>3500000000 and CUDevicesNames[0]!="" and ("Use CuBLAS" in runopts or "Use hipBLAS (ROCM)" in runopts) and runopts_var.get()=="Use OpenBLAS":
             if "Use CuBLAS" in runopts:
                 runopts_var.set("Use CuBLAS")
-            elif "Use hipBLAS (ROCm)" in runopts:
-                runopts_var.set("Use hipBLAS (ROCm)")
+            elif "Use hipBLAS (ROCM)" in runopts:
+                runopts_var.set("Use hipBLAS (ROCM)")
 
         changed_gpu_choice_var()
         return
-
-    def on_picked_model_file(filepath):
-        if filepath.lower().endswith('.kcpps'):
-            #load it as a config file instead
-            with open(filepath, 'r') as f:
-                dict = json.load(f)
-                import_vars(dict)
-        else:
-            autoset_gpu_layers(filepath)
 
     def autoset_gpu_layers(filepath): #shitty algo to determine how many layers to use
         try:
@@ -1396,8 +1276,6 @@ def show_new_gui():
     gpulayers_var.trace("w", changed_gpulayers)
 
     def changerunmode(a,b,c):
-        global runmode_untouched
-        runmode_untouched = False
         index = runopts_var.get()
         if index == "Use CLBlast" or index == "CLBlast NoAVX2 (Old CPU)" or index == "Use CuBLAS" or index == "Use hipBLAS (ROCm)":
             quick_gpuname_label.grid(row=3, column=1, padx=75, sticky="W")
@@ -1485,7 +1363,7 @@ def show_new_gui():
     makeslider(quick_tab, "Context Size:", contextsize_text, context_var, 0, len(contextsize_text)-1, 30, set=3)
 
     # load model
-    makefileentry(quick_tab, "Model:", "Select GGML Model File", model_var, 40, 170, onchoosefile=on_picked_model_file)
+    makefileentry(quick_tab, "Model:", "Select GGML Model File", model_var, 40, 170, onchoosefile=autoset_gpu_layers)
 
     # Hardware Tab
     hardware_tab = tabcontent["Hardware"]
@@ -1529,8 +1407,6 @@ def show_new_gui():
 
     runopts_var.trace('w', changerunmode)
     changerunmode(1,1,1)
-    global runmode_untouched
-    runmode_untouched = True
 
     # Tokens Tab
     tokens_tab = tabcontent["Tokens"]
@@ -1558,7 +1434,7 @@ def show_new_gui():
     # Model Tab
     model_tab = tabcontent["Model"]
 
-    makefileentry(model_tab, "Model:", "Select GGML Model File", model_var, 1, onchoosefile=on_picked_model_file)
+    makefileentry(model_tab, "Model:", "Select GGML Model File", model_var, 1, onchoosefile=autoset_gpu_layers)
     makefileentry(model_tab, "Lora:", "Select Lora File",lora_var, 3)
     makefileentry(model_tab, "Lora Base:", "Select Lora Base File", lora_base_var, 5)
     makefileentry(model_tab, "Preloaded Story:", "Select Preloaded Story File", preloadstory_var, 7)
@@ -1574,24 +1450,21 @@ def show_new_gui():
     makecheckbox(network_tab, "Remote Tunnel", remotetunnel, 3, 1)
     makecheckbox(network_tab, "Quiet Mode", quietmode, 4)
 
-    makefileentry(network_tab, "SSL Cert:", "Select SSL cert.pem file",ssl_cert_var, 5, width=130 ,filetypes=[("Unencrypted Certificate PEM", "*.pem")], singlerow=True)
-    makefileentry(network_tab, "SSL Key:", "Select SSL key.pem file", ssl_key_var, 7, width=130, filetypes=[("Unencrypted Key PEM", "*.pem")], singlerow=True)
-
     # horde
-    makelabel(network_tab, "Horde:", 18).grid(pady=10)
+    makelabel(network_tab, "Horde:", 5).grid(pady=10)
 
-    horde_name_entry,  horde_name_label = makelabelentry(network_tab, "Horde Model Name:", horde_name_var, 20, 180)
-    horde_gen_entry,  horde_gen_label = makelabelentry(network_tab, "Gen. Length:", horde_gen_var, 21, 50)
-    horde_context_entry,  horde_context_label = makelabelentry(network_tab, "Max Context:",horde_context_var, 22, 50)
-    horde_apikey_entry,  horde_apikey_label = makelabelentry(network_tab, "API Key (If Embedded Worker):",horde_apikey_var, 23, 180)
-    horde_workername_entry,  horde_workername_label = makelabelentry(network_tab, "Horde Worker Name:",horde_workername_var, 24, 180)
+    horde_name_entry,  horde_name_label = makelabelentry(network_tab, "Horde Model Name:", horde_name_var, 10, 180)
+    horde_gen_entry,  horde_gen_label = makelabelentry(network_tab, "Gen. Length:", horde_gen_var, 11, 50)
+    horde_context_entry,  horde_context_label = makelabelentry(network_tab, "Max Context:",horde_context_var, 12, 50)
+    horde_apikey_entry,  horde_apikey_label = makelabelentry(network_tab, "API Key (If Embedded Worker):",horde_apikey_var, 13, 180)
+    horde_workername_entry,  horde_workername_label = makelabelentry(network_tab, "Horde Worker Name:",horde_workername_var, 14, 180)
 
     def togglehorde(a,b,c):
         labels = [horde_name_label, horde_gen_label, horde_context_label, horde_apikey_label, horde_workername_label]
         for idx, item in enumerate([horde_name_entry, horde_gen_entry, horde_context_entry, horde_apikey_entry, horde_workername_entry]):
             if usehorde_var.get() == 1:
-                item.grid(row=20 + idx, column = 1, padx=8, pady=1, stick="nw")
-                labels[idx].grid(row=20 + idx, padx=8, pady=1, stick="nw")
+                item.grid(row=10 + idx, column = 1, padx=8, pady=1, stick="nw")
+                labels[idx].grid(row=10 + idx, padx=8, pady=1, stick="nw")
             else:
                 item.grid_forget()
                 labels[idx].grid_forget()
@@ -1599,7 +1472,7 @@ def show_new_gui():
             basefile = os.path.basename(model_var.get())
             horde_name_var.set(sanitize_string(os.path.splitext(basefile)[0]))
 
-    makecheckbox(network_tab, "Configure for Horde", usehorde_var, 19, command=togglehorde)
+    makecheckbox(network_tab, "Configure for Horde", usehorde_var, 6, command=togglehorde)
     togglehorde(1,1,1)
 
     # launch
@@ -1670,9 +1543,6 @@ def show_new_gui():
         args.lora = None if lora_var.get() == "" else ([lora_var.get()] if lora_base_var.get()=="" else [lora_var.get(), lora_base_var.get()])
         args.preloadstory = None if preloadstory_var.get() == "" else preloadstory_var.get()
 
-        args.ssl = None if (ssl_cert_var.get() == "" or ssl_key_var.get() == "") else ([ssl_cert_var.get(), ssl_key_var.get()])
-
-
         args.port_param = defaultport if port_var.get()=="" else int(port_var.get())
         args.host = host_var.get()
         args.multiuser = multiuser_var.get()
@@ -1710,7 +1580,7 @@ def show_new_gui():
                 if cublas_option:
                     runopts_var.set(cublas_option)
                 elif hipblas_option:
-                    runopts_var.set(hipblas_option)
+                    runopts_var.set(cublas_option)
                 lowvram_var.set(1 if "lowvram" in dict["usecublas"] else 0)
                 mmq_var.set(1 if "mmq" in dict["usecublas"] else 0)
                 gpu_choice_var.set("All")
@@ -1762,11 +1632,6 @@ def show_new_gui():
                 lora_base_var.set(dict["lora"][1])
             else:
                 lora_var.set(dict["lora"][0])
-
-        if "ssl" in dict and dict["ssl"]:
-            if len(dict["ssl"]) == 2:
-                ssl_cert_var.set(dict["ssl"][0])
-                ssl_key_var.set(dict["ssl"][1])
 
         if "preloadstory" in dict and dict["preloadstory"]:
             preloadstory_var.set(dict["preloadstory"])
@@ -1863,48 +1728,23 @@ def show_gui_msgbox(title,message):
     except Exception as ex2:
         pass
 
-def print_with_time(txt):
-    from datetime import datetime
-    print(f"{datetime.now().strftime('[%H:%M:%S]')} " + txt)
-
-def make_url_request(url, data, method='POST', headers={}):
-    import urllib.request
-    try:
-        request = None
-        if method=='POST':
-            json_payload = json.dumps(data).encode('utf-8')
-            request = urllib.request.Request(url, data=json_payload, headers=headers, method=method)
-            request.add_header('content-type', 'application/json')
-        else:
-            request = urllib.request.Request(url, headers=headers, method=method)
-        response_data = ""
-        with urllib.request.urlopen(request) as response:
-            response_data = response.read().decode('utf-8')
-            json_response = json.loads(response_data)
-            return json_response
-    except urllib.error.HTTPError as e:
-        try:
-            errmsg = e.read().decode('utf-8')
-            print_with_time(f"Error: {e} - {errmsg}")
-        except Exception as e:
-            print_with_time(f"Error: {e}")
-        return None
-    except Exception as e:
-        print_with_time(f"Error: {e} - {response_data}")
-        return None
-
 #A very simple and stripped down embedded horde worker with no dependencies
 def run_horde_worker(args, api_key, worker_name):
+    import urllib.request
     from datetime import datetime
     global friendlymodelname, maxhordectx, maxhordelen, exitcounter, punishcounter, modelbusy, session_starttime
     epurl = f"http://localhost:{args.port}"
     if args.host!="":
         epurl = f"http://{args.host}:{args.port}"
 
+    def print_with_time(txt):
+        print(f"{datetime.now().strftime('[%H:%M:%S]')} " + txt)
+
     def submit_completed_generation(url, jobid, sessionstart, submit_dict):
         global exitcounter, punishcounter, session_kudos_earned, session_jobs, rewardcounter
-        reply = make_url_request_horde(url, submit_dict)
+        reply = make_url_request(url, submit_dict)
         if not reply:
+            exitcounter += 1
             punishcounter += 1
             print_with_time(f"Error, Job submit failed.")
         else:
@@ -1922,46 +1762,60 @@ def run_horde_worker(args, api_key, worker_name):
             rewardcounter += 1
             if rewardcounter > 50:
                 rewardcounter = 0
-                if exitcounter > 1:
+                if exitcounter > 5:
                     exitcounter -= 1
 
-    def make_url_request_horde(url, data, method='POST'):
-        headers = headers = {"apikey": api_key,'User-Agent':'KoboldCppEmbeddedWorkerV2','Client-Agent':'KoboldCppEmbedWorker:2'}
-        ret = make_url_request(url, data, method, headers)
-        if not ret:
-            print("Make sure your Horde API key and worker name is valid!")
-        return ret
+    def make_url_request(url, data, method='POST'):
+        try:
+            request = None
+            headers = {"apikey": api_key,'User-Agent':'KoboldCppEmbeddedWorkerV2','Client-Agent':'KoboldCppEmbedWorker:2'}
+            if method=='POST':
+                json_payload = json.dumps(data).encode('utf-8')
+                request = urllib.request.Request(url, data=json_payload, headers=headers, method=method)
+                request.add_header('content-type', 'application/json')
+            else:
+                request = urllib.request.Request(url, headers=headers, method=method)
+            response_data = ""
+            with urllib.request.urlopen(request) as response:
+                response_data = response.read().decode('utf-8')
+                json_response = json.loads(response_data)
+                return json_response
+        except urllib.error.HTTPError as e:
+            try:
+                errmsg = e.read().decode('utf-8')
+                print_with_time(f"Error: {e} - {errmsg}, Make sure your Horde API key and worker name is valid.")
+            except Exception as e:
+                print_with_time(f"Error: {e}, Make sure your Horde API key and worker name is valid.")
+            return None
+        except Exception as e:
+            print_with_time(f"Error: {e} - {response_data}, Make sure your Horde API key and worker name is valid.")
+            return None
 
     current_id = None
     current_payload = None
     current_generation = None
     session_starttime = datetime.now()
     sleepy_counter = 0 #if this exceeds a value, worker becomes sleepy (slower)
-    exitcounter = 0
     print(f"===\nEmbedded Horde Worker '{worker_name}' Starting...\n(To use your own KAI Bridge/Scribe worker instead, don't set your API key)")
     BRIDGE_AGENT = f"KoboldCppEmbedWorker:2:https://github.com/LostRuins/koboldcpp"
     cluster = "https://horde.koboldai.net"
-    while exitcounter < 10:
+    while exitcounter < 35:
         time.sleep(3)
-        readygo = make_url_request_horde(f'{epurl}/api/v1/info/version', None,'GET')
+        readygo = make_url_request(f'{epurl}/api/v1/info/version', None,'GET')
         if readygo:
             print_with_time(f"Embedded Horde Worker '{worker_name}' is started.")
             break
 
-    while exitcounter < 10:
+    while exitcounter < 40:
         currentjob_attempts = 0
         current_generation = None
 
-        if punishcounter >= 5:
+        if punishcounter >= 8:
             punishcounter = 0
-            exitcounter += 1
-            if exitcounter < 10:
-                penaltytime = (2 ** exitcounter)
-                print_with_time(f"Horde Worker Paused for {penaltytime} min - Too many errors. It will resume automatically, but you should restart it.")
-                print_with_time(f"Caution: Too many failed jobs may lead to entering maintenance mode.")
-                time.sleep(60 * penaltytime)
-            else:
-                 print_with_time(f"Horde Worker Exit limit reached, too many errors.")
+            penaltymult = (1 + (exitcounter//10))
+            print_with_time(f"Horde Worker Paused for {penaltymult*10} min - Too many errors. It will resume automatically, but you should restart it.")
+            print_with_time(f"Caution: Too many failed jobs may lead to entering maintenance mode.")
+            time.sleep(600 * penaltymult)
 
         #first, make sure we are not generating
         if modelbusy.locked():
@@ -1978,8 +1832,9 @@ def run_horde_worker(args, api_key, worker_name):
             "softprompts": [],
             "bridge_agent": BRIDGE_AGENT,
         }
-        pop = make_url_request_horde(f'{cluster}/api/v2/generate/text/pop',gen_dict)
+        pop = make_url_request(f'{cluster}/api/v2/generate/text/pop',gen_dict)
         if not pop:
+            exitcounter += 1
             punishcounter += 1
             print_with_time(f"Failed to fetch job from {cluster}. Waiting 10 seconds...")
             time.sleep(10)
@@ -1999,9 +1854,9 @@ def run_horde_worker(args, api_key, worker_name):
         print_with_time(f"Job received from {cluster} for {current_payload.get('max_length',80)} tokens and {current_payload.get('max_context_length',1024)} max context. Starting generation...")
 
         #do gen
-        while exitcounter < 10:
+        while exitcounter < 35:
             if not modelbusy.locked():
-                current_generation = make_url_request_horde(f'{epurl}/api/v1/generate', current_payload)
+                current_generation = make_url_request(f'{epurl}/api/v1/generate', current_payload)
                 if current_generation:
                     break
                 else:
@@ -2311,39 +2166,25 @@ def main(launch_args,start_server=True):
         basepath = os.path.abspath(os.path.dirname(__file__))
         with open(os.path.join(basepath, "klite.embd"), mode='rb') as f:
             embedded_kailite = f.read()
-            # patch it with extra stuff
-            origStr = "Sorry, Kobold Lite requires Javascript to function."
-            patchedStr = "Sorry, Kobold Lite requires Javascript to function.<br>You can use <a class=\"color_blueurl\" href=\"/noscript\">KoboldCpp NoScript mode</a> instead."
-            embedded_kailite = embedded_kailite.decode("UTF-8","ignore")
-            embedded_kailite = embedded_kailite.replace(origStr, patchedStr)
-            embedded_kailite = embedded_kailite.encode()
             print("Embedded Kobold Lite loaded.")
-    except Exception as e:
+    except:
         print("Could not find Kobold Lite. Embedded Kobold Lite will not be available.")
 
     try:
         basepath = os.path.abspath(os.path.dirname(__file__))
         with open(os.path.join(basepath, "kcpp_docs.embd"), mode='rb') as f:
             embedded_kcpp_docs = f.read()
-    except Exception as e:
+    except:
         print("Could not find Embedded KoboldCpp API docs.")
 
     if args.port_param!=defaultport:
         args.port = args.port_param
 
-    global sslvalid
-    if args.ssl:
-        if len(args.ssl)==2 and isinstance(args.ssl[0], str) and os.path.exists(args.ssl[0]) and isinstance(args.ssl[1], str) and os.path.exists(args.ssl[1]):
-            sslvalid = True
-            print("SSL configuration is valid and will be used.")
-        else:
-            print("Your SSL configuration is INVALID. SSL will not be used.")
     epurl = ""
-    httpsaffix = ("https" if sslvalid else "http")
     if args.host=="":
-        epurl = f"{httpsaffix}://localhost:{args.port}"
+        epurl = f"http://localhost:{args.port}"
     else:
-        epurl = f"{httpsaffix}://{args.host}:{args.port}"
+        epurl = f"http://{args.host}:{args.port}"
     if not args.remotetunnel:
         print(f"Starting Kobold API on port {args.port} at {epurl}/api/")
         print(f"Starting OpenAI Compatible API on port {args.port} at {epurl}/v1/")
@@ -2376,26 +2217,6 @@ def main(launch_args,start_server=True):
         asyncio.run(RunServerMultiThreaded(args.host, args.port, embedded_kailite, embedded_kcpp_docs))
     else:
         print(f"Server was not started, main function complete. Idling.")
-
-def run_in_queue(launch_args, input_queue, output_queue):
-    main(launch_args, start_server=False)
-    output_queue.put({'command': 'complete'})
-    while True:
-        if not input_queue.empty():
-            while not input_queue.empty():
-                data = input_queue.get()
-                if data['command'] == 'generate':
-                    (args, kwargs) = data['data']
-                output_queue.put({'command': 'generated text', 'data': generate(*args, **kwargs)})
-        time.sleep(0.2)
-
-def start_in_seperate_process(launch_args):
-    import multiprocessing
-    input_queue = multiprocessing.Queue()
-    output_queue = multiprocessing.Queue()
-    p = multiprocessing.Process(target=run_in_queue, args=(launch_args, input_queue, output_queue))
-    p.start()
-    return (output_queue, input_queue, p)
 
 if __name__ == '__main__':
     print("***\nWelcome to KoboldCpp - Version " + KcppVersion) # just update version manually
@@ -2443,8 +2264,6 @@ if __name__ == '__main__':
     parser.add_argument("--foreground", help="Windows only. Sends the terminal to the foreground every time a new prompt is generated. This helps avoid some idle slowdown issues.", action='store_true')
     parser.add_argument("--preloadstory", help="Configures a prepared story json save file to be hosted on the server, which frontends (such as Kobold Lite) can access over the API.", default="")
     parser.add_argument("--quiet", help="Enable quiet mode, which hides generation inputs and outputs in the terminal. Quiet mode is automatically enabled when running --hordeconfig.", action='store_true')
-    parser.add_argument("--ssl", help="Allows all content to be served over SSL instead. A valid UNENCRYPTED SSL cert and key .pem files must be provided", metavar=('[cert_pem]', '[key_pem]'), nargs='+')
-
 
     # #deprecated hidden args. they do nothing. do not use
     # parser.add_argument("--psutil_set_threads", action='store_true', help=argparse.SUPPRESS)

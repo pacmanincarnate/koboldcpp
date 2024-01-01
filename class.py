@@ -9,7 +9,7 @@ import torch
 import requests
 import numpy as np
 from typing import List, Optional, Union
-import os, time
+import os
 from . import koboldcpp
 
 import utils
@@ -20,8 +20,10 @@ from modeling.inference_model import (
     InferenceModel,
 )
 
-model_backend_name = "KoboldCPP" #specific instead of ggml
+model_backend_name = "koboldcpp" #specific instead of ggml
 model_backend_type = "ggml" #This should be a generic name in case multiple model backends are compatible (think Hugging Face Custom and Basic Hugging Face)
+
+kcpp_backend_loaded = False
 
 class KoboldCppException(Exception):
     """To be used for errors on cpp side of KoboldCpp."""
@@ -33,7 +35,6 @@ class KcppArgsObject:
 class model_backend(InferenceModel):
     def __init__(self) -> None:
         super().__init__()
-        self.kcpp_backend_loaded = False
 
     def is_valid(self, model_name, model_path, menu_path):
 
@@ -256,31 +257,26 @@ class model_backend(InferenceModel):
 
     def unload(self):
         print("Attemping to unload library")
-        self.process.terminate()
-        
+        koboldcpp.unload_libs()
+        global kcpp_backend_loaded
+        kcpp_backend_loaded = False
+        pass
 
     def _load(self, save_model: bool, initial_load: bool) -> None:
+        global kcpp_backend_loaded
         self.tokenizer = self._get_tokenizer("gpt2")
-        kcppargs = KcppArgsObject(model=self.kcpp_filename, model_param=self.kcpp_filename,
-        port=5001, port_param=5001, host='', launch=False, lora=None, threads=self.kcpp_threads, blasthreads=self.kcpp_threads,
-        psutil_set_threads=False, highpriority=False, contextsize=self.kcpp_ctxsize,
-        blasbatchsize=self.kcpp_blasbatchsize, ropeconfig=[self.kcpp_ropescale, self.kcpp_ropebase], stream=False, smartcontext=self.kcpp_smartcontext,
-        unbantokens=False, bantokens=None, usemirostat=None, forceversion=0, nommap=self.kcpp_nommap,
-        usemlock=False, noavx2=self.kcpp_noavx2, debugmode=self.kcpp_debugmode, skiplauncher=True, hordeconfig=None, noblas=self.kcpp_noblas,
-        useclblast=self.kcpp_useclblast, usecublas=self.kcpp_usecublas, gpulayers=self.kcpp_gpulayers, tensor_split=self.kcpp_tensor_split, config=None,
-        onready='', multiuser=False, foreground=False, preloadstory=None, noshift=False, remotetunnel=False)
-        
+        if not kcpp_backend_loaded:
+            kcppargs = KcppArgsObject(model=self.kcpp_filename, model_param=self.kcpp_filename,
+            port=5001, port_param=5001, host='', launch=False, lora=None, threads=self.kcpp_threads, blasthreads=self.kcpp_threads,
+            highpriority=False, contextsize=self.kcpp_ctxsize, blasbatchsize=self.kcpp_blasbatchsize, ropeconfig=[self.kcpp_ropescale, self.kcpp_ropebase],
+            smartcontext=self.kcpp_smartcontext, bantokens=None, forceversion=0, nommap=self.kcpp_nommap,
+            usemlock=False, noavx2=self.kcpp_noavx2, debugmode=self.kcpp_debugmode, skiplauncher=True, hordeconfig=None, noblas=self.kcpp_noblas,
+            useclblast=self.kcpp_useclblast, usecublas=self.kcpp_usecublas, gpulayers=self.kcpp_gpulayers, tensor_split=self.kcpp_tensor_split, config=None,
+            onready='', multiuser=False, foreground=False)
 
-        #koboldcpp.main(kcppargs,False) #initialize library without enabling Lite http server
-        (self.output_queue, self.input_queue, self.process) = koboldcpp.start_in_seperate_process(kcppargs)
-        while True:
-            data = self.output_queue.get()
-            if data['command'] == 'load status':
-                utils.koboldai_vars.total_layers = data['data']['total']
-                utils.koboldai_vars.loaded_layers = data['data']['loaded']
-            elif data['command'] == 'complete':
-                break
-            time.sleep(0.02)
+            koboldcpp.main(kcppargs,False) #initialize library without enabling Lite http server
+            kcpp_backend_loaded = True
+        pass
 
     def _save_settings(self):
         pass
@@ -301,31 +297,16 @@ class model_backend(InferenceModel):
         # Store context in memory to use it for comparison with generated content
         utils.koboldai_vars.lastctx = decoded_prompt
 
-        self.input_queue.put({'command': 'generate', 'data': [(decoded_prompt,max_new,utils.koboldai_vars.max_length,
-                                gen_settings.temp,int(gen_settings.top_k),gen_settings.top_a,gen_settings.top_p,
-                                gen_settings.typical,gen_settings.tfs,gen_settings.rep_pen,gen_settings.rep_pen_range),
-                               {"sampler_order": gen_settings.sampler_order, "use_default_badwordsids": utils.koboldai_vars.use_default_badwordsids}
-                                ]})
-        
-        #genresult = koboldcpp.generate(decoded_prompt,max_new,utils.koboldai_vars.max_length,
-        #gen_settings.temp,int(gen_settings.top_k),gen_settings.top_a,gen_settings.top_p,
-        #gen_settings.typical,gen_settings.tfs,gen_settings.rep_pen,gen_settings.rep_pen_range,
-        #sampler_order=gen_settings.sampler_order,use_default_badwordsids=utils.koboldai_vars.use_default_badwordsids)
-           
-        genresult = []
-        while True:
-            data = self.output_queue.get()
-            print(data)
-            if data['command'] == 'generated text':
-                genresult.append(data['data'])
-                if self.output_queue.empty():
-                    break
-            time.sleep(0.02)
+        genresult = koboldcpp.generate(decoded_prompt,max_new,utils.koboldai_vars.max_length,
+        gen_settings.temp,int(gen_settings.top_k),gen_settings.top_a,gen_settings.top_p,
+        gen_settings.typical,gen_settings.tfs,gen_settings.rep_pen,gen_settings.rep_pen_range,
+        sampler_order=gen_settings.sampler_order,use_default_badwordsids=utils.koboldai_vars.use_default_badwordsids)
 
+        outputs = [genresult]
         return GenerationResult(
             model=self,
             out_batches=np.array(
-                [self.tokenizer.encode(x) for x in genresult]
+                [self.tokenizer.encode(x) for x in outputs]
             ),
             prompt=prompt_tokens,
             is_whole_generation=True,
