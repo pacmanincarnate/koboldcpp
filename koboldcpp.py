@@ -71,7 +71,10 @@ class generation_inputs(ctypes.Structure):
                 ("stream_sse", ctypes.c_bool),
                 ("grammar", ctypes.c_char_p),
                 ("grammar_retain_state", ctypes.c_bool),
-                ("quiet", ctypes.c_bool)]
+                ("quiet", ctypes.c_bool)
+                ("user_top", ctypes.c_float),
+                ("slope", ctypes.c_float),
+                ("top_correction", ctypes.c_float),]
 
 class generation_outputs(ctypes.Structure):
     _fields_ = [("status", ctypes.c_int),
@@ -300,7 +303,7 @@ def load_model(model_filename):
     ret = handle.load_model(inputs)
     return ret
 
-def generate(prompt, memory="", max_length=32, max_context_length=512, temperature=0.7, top_k=100, top_a=0.0, top_p=0.92, min_p=0.0, typical_p=1.0, tfs=1.0, rep_pen=1.1, rep_pen_range=128, mirostat=0, mirostat_tau=5.0, mirostat_eta=0.1, sampler_order=[6,0,1,3,4,2,5], seed=-1, stop_sequence=[], use_default_badwordsids=False, stream_sse=False, grammar='', grammar_retain_state=False, genkey='', trimstop=False, quiet=False):
+def generate(prompt, memory="", max_length=32, max_context_length=512, temperature=0.7, top_k=100, top_a=0.0, top_p=0.92, min_p=0.0, typical_p=1.0, tfs=1.0, rep_pen=1.1, rep_pen_range=128, mirostat=0, mirostat_tau=5.0, mirostat_eta=0.1, sampler_order=[6,0,1,3,4,2,5], seed=-1, stop_sequence=[], use_default_badwordsids=False, stream_sse=False, grammar='', grammar_retain_state=False, genkey='', trimstop=False, quiet=False, user_top=0.75, slope=0.1, top_correction=0.5):
     global maxctx, args, currentusergenkey, totalgens
     inputs = generation_inputs()
     outputs = ctypes.create_unicode_buffer(ctypes.sizeof(generation_outputs))
@@ -323,6 +326,9 @@ def generate(prompt, memory="", max_length=32, max_context_length=512, temperatu
     inputs.min_p = min_p
     inputs.typical_p = typical_p
     inputs.tfs = tfs
+    inputs.user_top = user_top
+    inputs.slope = slope
+    inputs.top_correction = top_correction
     inputs.rep_pen = rep_pen
     inputs.rep_pen_range = rep_pen_range
     inputs.stream_sse = stream_sse
@@ -495,6 +501,9 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                 min_p=genparams.get('min_p', 0.0),
                 typical_p=genparams.get('typical', 1.0),
                 tfs=genparams.get('tfs', 1.0),
+                user_top=genparams.get('user_top', 0.75),
+                slope=genparams.get('slope', 0.1),
+                top_correction=genparams.get('top_correction', 0.5),
                 rep_pen=genparams.get('rep_pen', 1.1),
                 rep_pen_range=genparams.get('rep_pen_range', 256),
                 mirostat=genparams.get('mirostat', 0),
