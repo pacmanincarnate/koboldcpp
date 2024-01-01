@@ -45,7 +45,7 @@ struct gpt_params {
     int32_t n_ctx                           = 512;   // context size
     int32_t n_batch                         = 512;   // batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_keep                          = 0;     // number of tokens to keep from initial prompt
-    int32_t n_draft                         = 8;     // number of tokens to draft during speculative decoding
+    int32_t n_draft                         = 16;    // number of tokens to draft during speculative decoding
     int32_t n_chunks                        = -1;    // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel                      = 1;     // number of parallel sequences to decode
     int32_t n_sequences                     = 1;     // number of sequences to decode
@@ -80,6 +80,9 @@ struct gpt_params {
     int32_t mirostat          = 0;     // 0 = disabled, 1 = mirostat, 2 = mirostat 2.0
     float   mirostat_tau      = 5.00f; // target entropy
     float   mirostat_eta      = 0.10f; // learning rate
+    float   userTop           = 0.75f; //user selected probability of top token (0 - 1) 0.0 = disabled. ***need to code that***
+    float   slope             = 0.10f; //adjust slope of non-top token probabilities. range 0 - 10 (0 = disabled).
+    float   topCorrection     = 0.5f; // correct userTop for very low non-top probabilities. 0 = disabled. (range 0 - 1).
     // // sampling parameters
     struct llama_sampling_params sparams;
 
@@ -94,8 +97,6 @@ struct gpt_params {
     std::vector<std::string> antiprompt; // string upon seeing which more user input is prompted
     std::string logdir            = "";  // directory in which to save YAML log files
 
-    std::vector<llama_model_kv_override> kv_overrides;
-
     // TODO: avoid tuple, use struct
     std::vector<std::tuple<std::string, float>> lora_adapter; // lora adapter path with user defined scale
     std::string lora_base  = "";                              // base model path for the lora adapter
@@ -108,6 +109,7 @@ struct gpt_params {
     size_t hellaswag_tasks = 400;   // number of tasks to use when computing the HellaSwag score
 
     bool mul_mat_q         = true;  // if true, use mul_mat_q kernels instead of cuBLAS
+    bool memory_f16        = true;  // use f16 instead of f32 for memory kv
     bool random_prompt     = false; // do not randomize prompt if none provided
     bool use_color         = false; // use color to distinguish generations and inputs
     bool interactive       = false; // interactive mode
@@ -132,14 +134,10 @@ struct gpt_params {
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool infill            = false; // use infill mode
     bool dump_kv_cache     = false; // dump the KV cache contents for debugging purposes
-    bool no_kv_offload     = false; // disable KV offloading
-
-    std::string cache_type_k = "f16"; // KV cache data type for the K
-    std::string cache_type_v = "f16"; // KV cache data type for the V
 
     // multimodal models (see examples/llava)
     std::string mmproj = ""; // path to multimodal projector
-    std::string image  = ""; // path to an image file
+    std::string image = ""; // path to an image file
 };
 
 bool gpt_params_parse_ex(int argc, char ** argv, gpt_params & params);
@@ -153,12 +151,6 @@ std::string get_system_info(const gpt_params & params);
 std::string gpt_random_prompt(std::mt19937 & rng);
 
 void process_escapes(std::string& input);
-
-//
-// String parsing
-//
-
-std::string parse_samplers_input(std::string input);
 
 //
 // Model utils
@@ -248,4 +240,3 @@ void dump_kv_cache_view(const llama_kv_cache_view & view, int row_size = 80);
 
 // Dump the KV cache view showing individual sequences in each cell (long output).
 void dump_kv_cache_view_seqs(const llama_kv_cache_view & view, int row_size = 40);
-
