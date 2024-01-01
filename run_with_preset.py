@@ -18,7 +18,7 @@ CLI_ARGS_MAIN_PERPLEXITY = [
     "prompt-cache", "prompt-cache-all", "prompt-cache-ro", "random-prompt", "repeat-last-n",
     "repeat-penalty", "reverse-prompt", "rope-freq-base", "rope-freq-scale", "rope-scale", "seed",
     "simple-io", "tensor-split", "threads", "temp", "tfs", "top-k", "top-p", "typical",
-    "verbose-prompt"
+    "verbose-prompt", "user-top", "slope", "top-correction"
 ]
 
 CLI_ARGS_LLAMA_BENCH = [
