@@ -82,9 +82,6 @@ static int n_batch = 8;
 static bool useSmartContext = false;
 static bool useContextShift = false;
 static int blasbatchsize = 512;
-static int dontblasbatchsize = 16;
-static int normalbatchsize = 32;
-static int smallbatchsize = 8;
 static int debugmode = 0; //-1 = hide all, 0 = normal, 1 = showall
 static std::string modelname;
 static std::vector<gpt_vocab::id> last_n_tokens;
@@ -389,7 +386,7 @@ void sample_top_a(llama_token_data_array * candidates, float a, size_t min_keep)
     candidates->size = last_idx;
 }
 
-void sample_rep_pen(int n_ctx, int rep_pen_range, float rep_pen, float presence_penalty, llama_token_data_array * candidates_p)
+void sample_rep_pen(int n_ctx, int rep_pen_range, float rep_pen, llama_token_data_array * candidates_p)
 {
     auto last_n_repeat = std::min(std::min((int)last_n_tokens.size(), rep_pen_range), n_ctx);
 
@@ -398,7 +395,7 @@ void sample_rep_pen(int n_ctx, int rep_pen_range, float rep_pen, float presence_
     llama_token_data_array * candidates = candidates_p;
     float penalty = rep_pen;
 
-    if (last_tokens_size == 0 || (penalty == 1.0f && presence_penalty==0)) {
+    if (last_tokens_size == 0 || penalty == 1.0f) {
         return;
     }
 
@@ -417,8 +414,6 @@ void sample_rep_pen(int n_ctx, int rep_pen_range, float rep_pen, float presence_
         } else {
             candidates->data[i].logit /= penalty;
         }
-
-        candidates->data[i].logit -= presence_penalty;
     }
 
     candidates->sorted = false;
@@ -479,7 +474,7 @@ void sample_grammar(FileFormat file_format, int32_t n_vocab, llama_token_data_ar
 
 }
 
-int SampleLogits(const float * logits, int n_ctx, int n_vocab, int rep_pen_range, float rep_pen, float presence_penalty, float top_k, float top_a, float top_p, float min_p, float typical_p, float tfs, float temp, std::mt19937 & rng,
+int SampleLogits(const float * logits, int n_ctx, int n_vocab, int rep_pen_range, float rep_pen, float top_k, float top_a, float top_p, float min_p, float userTop, float slope, float topCorrection, float typical_p, float tfs, float temp, std::mt19937 & rng,
 int mirostat, float mirostat_tau, float mirostat_eta, const std::vector<samplers> & sampler_order, llama_grammar * grammar)
 {
     int id = 0;
@@ -499,7 +494,7 @@ int mirostat, float mirostat_tau, float mirostat_eta, const std::vector<samplers
     {
         static float mirostat_mu = 2.0f * mirostat_tau;
         const int mirostat_m = 100;
-        sample_rep_pen(n_ctx, rep_pen_range, rep_pen, presence_penalty, &candidates_p);
+        sample_rep_pen(n_ctx, rep_pen_range, rep_pen, &candidates_p);
         sample_temperature(&candidates_p, temp);
         if (mirostat == 1)
         {
@@ -519,6 +514,8 @@ int mirostat, float mirostat_tau, float mirostat_eta, const std::vector<samplers
                 case KCPP_SAMPLER_TOP_K:
                     llama_sample_top_k(nullptr, &candidates_p, top_k,1);
                     break;
+                case KCPP_SAMPLER_TOP_C:
+                    llama_sample_top_c(nullptr, &candidates_p, userTop, slope, topCorrection, 1);
                 case KCPP_SAMPLER_TOP_A:
                     sample_top_a(&candidates_p,top_a,1);
                     break;
@@ -536,7 +533,7 @@ int mirostat, float mirostat_tau, float mirostat_eta, const std::vector<samplers
                     sample_temperature(&candidates_p, temp);
                     break;
                 case KCPP_SAMPLER_REP_PEN:
-                    sample_rep_pen(n_ctx, rep_pen_range, rep_pen, presence_penalty, &candidates_p);
+                    sample_rep_pen(n_ctx, rep_pen_range, rep_pen, &candidates_p);
                     break;
                 default:
                     printf("\nSampleLogits: Unknown Sampler : %d",sampler_order[i]);
@@ -674,9 +671,7 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
     file_format = in_file_format;
     n_threads = params.n_threads = inputs.threads;
     n_blasthreads = params.n_threads_batch = inputs.blasthreads;
-    bool isGguf = (file_format == FileFormat::GGUF_LLAMA || file_format==FileFormat::GGUF_FALCON);
-
-    n_batch = params.n_batch = (isGguf?normalbatchsize:smallbatchsize);
+    n_batch = params.n_batch = inputs.batch_size;
     modelname = params.model = inputs.model_filename;
     useSmartContext = inputs.use_smartcontext;
     useContextShift = inputs.use_contextshift;
@@ -684,8 +679,9 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
     blasbatchsize = inputs.blasbatchsize;
     if(blasbatchsize<=0)
     {
-        blasbatchsize = (isGguf?dontblasbatchsize:smallbatchsize);
+        blasbatchsize = 8;
     }
+    params.memory_f16 = inputs.f16_kv;
 
     auto clamped_max_context_length = inputs.max_context_length;
 
@@ -774,7 +770,7 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
         llama_ctx_params_v2.n_ctx = clamped_max_context_length;
         //llama_ctx_params.n_parts = -1;
         llama_ctx_params_v2.seed = -1;
-        llama_ctx_params_v2.f16_kv = true;
+        llama_ctx_params_v2.f16_kv = inputs.f16_kv;
         llama_ctx_params_v2.logits_all = false;
         llama_ctx_params_v2.use_mmap = inputs.use_mmap;
         llama_ctx_params_v2.use_mlock = inputs.use_mlock;
@@ -824,7 +820,7 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
         llama_ctx_params.n_ctx = clamped_max_context_length;
         //llama_ctx_paran_parts = -1;
         llama_ctx_params.seed = -1;
-        llama_ctx_params.f16_kv = true;
+        llama_ctx_params.f16_kv = inputs.f16_kv;
         llama_ctx_params.low_vram = inputs.low_vram;
         llama_ctx_params.mul_mat_q = inputs.use_mmq;
         llama_ctx_params.logits_all = false;
@@ -901,8 +897,8 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
 
         //llama_ctx_paran_parts = -1;
         llama_ctx_params.seed = -1;
-        //llama_ctx_params.f16_kv = true;
-        llama_ctx_params.offload_kqv = !inputs.low_vram;
+        llama_ctx_params.f16_kv = inputs.f16_kv;
+        //llama_ctx_params.low_vram = inputs.low_vram;
         llama_ctx_params.mul_mat_q = inputs.use_mmq;
         llama_ctx_params.logits_all = false;
         model_params.use_mmap = inputs.use_mmap;
@@ -956,20 +952,20 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
             llamamodel->hparams.rope_freq_scale_train!=1.0f ||
             llamamodel->hparams.rope_scaling_type_train==2)
             {
-                // float ropemultiplier = 1.0f;
-                // if(llamamodel->hparams.rope_scaling_type_train!=2 &&
-                // llamamodel->hparams.n_ctx_train > 2048 && clamped_max_context_length > llamamodel->hparams.n_ctx_train &&
-                // llamamodel->hparams.rope_freq_scale_train==1.0f)
-                // {
-                //     ropemultiplier = (float)llamamodel->hparams.n_ctx_train / (float)clamped_max_context_length;
-                //     llama_ctx_params.rope_freq_base = rope_freq_base = llamamodel->hparams.rope_freq_base_train;
-                //     llama_ctx_params.rope_freq_scale = rope_freq_scale = ropemultiplier * llamamodel->hparams.rope_freq_scale_train;
-                //     printf("Automatic RoPE Scaling: Using (scale:%.3f, base:%.1f).\n", rope_freq_scale, rope_freq_base);
-                // }
-                // else
-                // {
+                float ropemultiplier = 1.0f;
+                if(llamamodel->hparams.rope_scaling_type_train!=2 &&
+                llamamodel->hparams.n_ctx_train > 2048 && clamped_max_context_length > llamamodel->hparams.n_ctx_train &&
+                llamamodel->hparams.rope_freq_scale_train==1.0f)
+                {
+                    ropemultiplier = (float)llamamodel->hparams.n_ctx_train / (float)clamped_max_context_length;
+                    llama_ctx_params.rope_freq_base = rope_freq_base = llamamodel->hparams.rope_freq_base_train;
+                    llama_ctx_params.rope_freq_scale = rope_freq_scale = ropemultiplier * llamamodel->hparams.rope_freq_scale_train;
+                    printf("Automatic RoPE Scaling: Using (scale:%.3f, base:%.1f).\n", rope_freq_scale, rope_freq_base);
+                }
+                else
+                {
                     printf("Automatic RoPE Scaling: Using model internal value.\n");
-                // }
+                }
             }
             else
             {
@@ -1396,7 +1392,7 @@ bool gpttype_generate_abort()
     return true;
 }
 
-std::vector<int> gpttype_get_token_arr(const std::string & input)
+int gpttype_token_count(const std::string & input)
 {
     if(debugmode==1)
     {
@@ -1409,7 +1405,7 @@ std::vector<int> gpttype_get_token_arr(const std::string & input)
     {
         printf("\nTokens Counted: %d\n",tokcount);
     }
-    return toks;
+    return tokcount;
 }
 
 const std::string & gpttype_get_pending_output()
@@ -1449,7 +1445,6 @@ generation_outputs gpttype_generate(const generation_inputs inputs, generation_o
     params.temp = inputs.temperature;
     params.repeat_last_n = inputs.rep_pen_range;
     params.repeat_penalty = inputs.rep_pen;
-    params.presence_penalty = inputs.presence_penalty;
     params.mirostat = inputs.mirostat;
     params.mirostat_eta = inputs.mirostat_eta;
     params.mirostat_tau = inputs.mirostat_tau;
@@ -1457,6 +1452,9 @@ generation_outputs gpttype_generate(const generation_inputs inputs, generation_o
     params.n_batch = n_batch;
     params.n_threads = n_threads;
     params.n_threads_batch = n_blasthreads;
+    params.userTop = inputs.user_top;
+    params.slope = inputs.slope;
+    params.topCorrection = inputs.top_correction;
     bool stream_sse = inputs.stream_sse;
 
     bool allow_regular_prints = (debugmode!=-1 && !inputs.quiet) || debugmode >= 1;
@@ -1640,7 +1638,8 @@ generation_outputs gpttype_generate(const generation_inputs inputs, generation_o
             KCPP_SAMPLER_TFS,
             KCPP_SAMPLER_TYP,
             KCPP_SAMPLER_TOP_P,
-            KCPP_SAMPLER_TEMP
+            KCPP_SAMPLER_TEMP,
+            KCPP_SAMPLER_TOP_C
         };
     }
     else
@@ -1839,12 +1838,14 @@ generation_outputs gpttype_generate(const generation_inputs inputs, generation_o
         {
             // out of user input, sample next token
             const float top_k = params.top_k;
+            const float userTop = params.userTop;
+            const float slope = params.slope;
+            const float topCorrection = params.topCorrection;
             const float top_p = params.top_p;
             const float min_p = params.min_p;
             const float temp = params.temp;
             const float top_a = inputs.top_a;
             const float repeat_penalty = params.repeat_penalty;
-            const float presence_penalty = params.presence_penalty;
             const float typical_p = params.typical_p;
             const float tfs_z = params.tfs_z;
 
@@ -1900,8 +1901,8 @@ generation_outputs gpttype_generate(const generation_inputs inputs, generation_o
                 }
             }
 
-            id = SampleLogits(logitsPtr, nctx, n_vocab, last_n_size, repeat_penalty, presence_penalty,
-            top_k, top_a, top_p, min_p, typical_p, tfs_z, temp, rng,
+            id = SampleLogits(logitsPtr, nctx, n_vocab, last_n_size, repeat_penalty,
+            top_k, top_a, top_p, min_p, userTop, slope, topCorrection, typical_p, tfs_z, temp, rng,
             params.mirostat, params.mirostat_tau, params.mirostat_eta, sampler_order, grammar);
 
             if (grammar != nullptr) {

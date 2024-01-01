@@ -13,6 +13,7 @@ enum samplers
     KCPP_SAMPLER_TYP=4,
     KCPP_SAMPLER_TEMP=5,
     KCPP_SAMPLER_REP_PEN=6,
+    KCPP_SAMPLER_TOP_C=7,
     KCPP_SAMPLER_MAX
 };
 enum stop_reason
@@ -27,6 +28,8 @@ struct load_model_inputs
     const int threads;
     const int blasthreads;
     const int max_context_length;
+    const int batch_size;
+    const bool f16_kv;
     const bool low_vram;
     const bool use_mmq;
     const char * executable_path;
@@ -64,7 +67,6 @@ struct generation_inputs
     const float tfs;
     const float rep_pen;
     const int rep_pen_range;
-    const float presence_penalty = 0.0f;
     const int mirostat = 0;
     const float mirostat_eta;
     const float mirostat_tau;
@@ -76,16 +78,14 @@ struct generation_inputs
     const char * grammar;
     const bool grammar_retain_state;
     const bool quiet = false;
+    const float user_top;
+    const float slope;
+    const float top_correction;
 };
 struct generation_outputs
 {
     int status = -1;
     char text[32768]; //32kb should be enough for any response
-};
-struct token_count_outputs
-{
-    int count = 0;
-    int * ids; //we'll just use shared memory for this one, bit of a hack
 };
 
 extern std::string executable_path;
